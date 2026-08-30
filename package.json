@@ -1,0 +1,15 @@
+{
+  "name": "poker-chip-settler",
+  "version": "7.0.0",
+  "description": "德州扑克筹码自动分配器 - 联机版",
+  "main": "server/server.js",
+  "scripts": {
+    "start": "node server/server.js"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}
