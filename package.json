@@ -1,7 +1,7 @@
 {
   "name": "poker-chip-settler",
-  "version": "7.0.0",
-  "description": "德州扑克筹码自动分配器 - 联机版",
+  "version": "9.6.0",
+  "description": "德州扑克筹码自动分配器 - 联机版（含完整历史记录、边池平分、场上玩家模块、专业叫法）",
   "main": "server/server.js",
   "scripts": {
     "start": "node server/server.js"

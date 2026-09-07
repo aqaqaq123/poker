@@ -27,6 +27,7 @@ function newRoom(){
     phase: "lobby", players: [], turn: null, order: [], result: null, logs: [],
     totalBuyin: 0, ownerId: null, dealerId: null, handsPlayed: 0,
     street: 0, round: 0, currentBet: 0, lastRaiseSize: 0, noRaise: false, lastBettorId: null,
+    raiseCount: 0,   // 当前下注轮内"构成加注"的动作次数（用于计算 open/3-bet/4-bet 等叫法）
     idSeq: 1, pending: [],
   };
 }
@@ -36,8 +37,8 @@ let room = (() => {
     const s = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
     if (!s || !s.config) throw new Error("bad");
     s.phase = "lobby"; s.turn = null; s.order = []; s.result = null; s.pending = [];
-    s.street = 0; s.round = 0; s.currentBet = 0; s.lastRaiseSize = 0; s.noRaise = false; s.lastBettorId = null;
-    s.players.forEach((p, i) => { p.roundBet = 0; p.folded = false; p.inHand = true; p.hasActed = true; if (!p.seat) p.seat = i + 1; });
+    s.street = 0; s.round = 0; s.currentBet = 0; s.lastRaiseSize = 0; s.noRaise = false; s.lastBettorId = null; s.raiseCount = 0;
+    s.players.forEach((p, i) => { p.roundBet = 0; p.folded = false; p.inHand = !p.resting; p.hasActed = true; if (!p.seat) p.seat = i + 1; });
     s.config = Object.assign({ sb: 1, bb: 2, turnSeconds: 60, addSeconds: 120, addCount: 5 }, s.config || {});
     return s;
   } catch (e) { return newRoom(); }
@@ -111,19 +112,13 @@ function onlineOf(pid, onlineSet){
   return false;
 }
 
-function nextOnlinePlayer(fromId, onlineSet){
-  const seated = room.players.slice().sort((a,b) => a.seat - b.seat);
-  const idx = seated.findIndex(p => p.id === fromId);
-  if (idx < 0) return null;
-  for (let i = 1; i <= seated.length; i++) { const p = seated[(idx + i) % seated.length]; if (onlineOf(p.id, onlineSet)) return p; }
-  return null;
-}
 function handleOffline(pid, onlineSet){
   if (!onlineOf(pid, onlineSet)) {
-    log(pname(pid) + " 已离线");
-    // 如果是庄家，移交给下一个在线玩家
-    if (room.dealerId === pid) { const next = nextOnlinePlayer(pid, onlineSet); if (next) { room.dealerId = next.id; log("庄家已离线，移交给 " + next.name); } }
+    const p = findPlayer(pid);
+    if (p) log(p.name + " 已离线");
+    // 找不到 p → 该玩家已被移出牌局，不再记"?"占位日志
     // 注意：不自动弃牌！掉线玩家的下注由超时检查处理（倒计时结束自动过牌，不弃牌）
+    // 注意：不自动移交庄家！庄家离线后保持原庄家位，回来后继续操作
   }
 }
 const pendingOffline = new Map();
@@ -150,23 +145,24 @@ function scheduleReqTimeout(req){ const t = setTimeout(() => { reqTimers.delete(
 // ========== 结算逻辑 ==========
 function settle(entries){
   const act = entries.filter(e => e.bet > 0);
-  const byId = {}; act.forEach(e => byId[e.id] = { id:e.id, name:e.name, bet:e.bet, rank:e.rank, win:0 });
-  let pool = act.map(e => ({ id:e.id, rank:e.rank, left:e.bet }));
+  const byId = {}; act.forEach(e => byId[e.id] = { id:e.id, name:e.name, bet:e.bet, rank:e.rank, seat:e.seat || 0, win:0 });
+  let pool = act.map(e => ({ id:e.id, name:e.name, seat:e.seat || 0, rank:e.rank, left:e.bet }));
   const pots = [];
   while (pool.length) {
     const min = Math.min(...pool.map(p => p.left));
     const size = min * pool.length;
     const bestRank = Math.min(...pool.map(p => p.rank));
     const winners = pool.filter(p => p.rank === bestRank);
-    const share = size / winners.length;
+    /* 整数平分：每人基础赢取 = floor(size/人数)，余数按座位从小到大分配（座位越靠前越先得奇数筹码） */
+    const base = Math.floor(size / winners.length);
+    const remainder = size % winners.length;
+    const sortedWinners = [...winners].sort((a,b) => (a.seat||0) - (b.seat||0));
+    winners.forEach(w => byId[w.id].win += base);
+    for (let i = 0; i < remainder; i++) { byId[sortedWinners[i].id].win += 1; }
     pots.push({ size, count: pool.length, winnerIds: winners.map(w=>w.id) });
-    winners.forEach(w => byId[w.id].win += share);
-    pool = pool.map(p => ({ id:p.id, rank:p.rank, left:p.left - min })).filter(p => p.left > 0);
+    pool = pool.map(p => ({ id:p.id, name:p.name, seat:p.seat, rank:p.rank, left:p.left - min })).filter(p => p.left > 0);
   }
-  let results = act.map(e => { const w = byId[e.id].win; return { id:e.id, name:e.name, bet:e.bet, rank:e.rank, win:Math.round(w), net:Math.round(w - e.bet) }; });
-  const sumBet = act.reduce((s,e)=>s + e.bet, 0);
-  const sumWin = results.reduce((s,r)=>s + r.win, 0);
-  if (results.length && sumWin !== sumBet) { const diff = sumBet - sumWin; const top = results.reduce((a,b)=> b.rank < a.rank ? b : a); top.win += diff; top.net += diff; }
+  let results = act.map(e => { const w = byId[e.id].win; return { id:e.id, name:e.name, bet:e.bet, rank:e.rank, win:w, net:w - e.bet }; });
   results.sort((a,b)=>a.rank - b.rank || a.bet - b.bet);
   return { pots, results };
 }
@@ -206,7 +202,13 @@ function toggleRest(player){
       else { log(player.name + " 休息，当前无其他玩家接任庄家"); }
     }
   } else {
-    log(player.name + " 结束休息，下一手恢复下注");
+    /* 对局过程中结束休息：本手仍不参与（明确置 inHand=false / folded=true），下一手 startHand 才自动恢复 */
+    if (room.phase === "betting" || room.phase === "settling" || room.phase === "show") {
+      player.inHand = false; player.folded = true; player.hasActed = true;
+      log(player.name + " 结束休息，本手仍不参与，下一手恢复下注");
+    } else {
+      log(player.name + " 结束休息，下一手恢复下注");
+    }
   }
 }
 
@@ -248,8 +250,8 @@ function afterAction(){
   if (withChips.length === 0 && alive.length > 1) {
     log("所有玩家已全下，自动发牌至河牌摊牌");
     while (room.street < 3) {
-      room.street++; room.round++; room.currentBet = 0; room.lastRaiseSize = room.config.bb; room.noRaise = false; room.lastBettorId = null;
-      room.players.forEach(p => { p.roundBet = 0; p.hasActed = false; });
+      room.street++; room.round++; room.currentBet = 0; room.lastRaiseSize = room.config.bb; room.noRaise = false; room.lastBettorId = null; room.raiseCount = 0;
+      room.players.forEach(p => { p.roundBet = 0; p.hasActed = false; p.lastActLabel = null; });
       log("自动进入 " + streetName() + "（所有人全下）");
     }
     endHand(); return;
@@ -271,10 +273,10 @@ setInterval(() => {
     p.hasActed = true;
     if (isOnline) {
       if (needToCallOf(p) > 0) { p.folded = true; log(p.name + " 超时需跟注，自动弃牌"); }
-      else { log(p.name + " 超时，自动过牌"); }
+      else { p.lastActLabel = "check"; log(p.name + " 超时，自动过牌"); }
     } else {
       // 掉线玩家：自动过牌，不弃牌，下一回合还能参与
-      log(p.name + " 掉线超时，自动过牌（本回合剥夺下注权，下一回合恢复）");
+      p.lastActLabel = "check"; log(p.name + " 掉线超时，自动过牌（本回合剥夺下注权，下一回合恢复）");
     }
     afterAction(); broadcast(); save();
   }
@@ -283,10 +285,10 @@ setInterval(() => {
 function startHand(){
   if (room.phase === "betting") return;
   room.handsPlayed++; room.phase = "betting"; room.result = null; room.order = [];
-  room.street = 0; room.round = 0; room.currentBet = 0; room.lastRaiseSize = room.config.bb; room.noRaise = false; room.lastBettorId = null;
-  room.players.forEach(p => { p.totalInvested = 0; p.roundBet = 0; p.hasActed = false; p.folded = false; p.inHand = (p.stack > 0 && !p.resting); });
+  room.street = 0; room.round = 0; room.currentBet = 0; room.lastRaiseSize = room.config.bb; room.noRaise = false; room.lastBettorId = null; room.raiseCount = 0;
+  room.players.forEach(p => { p.totalInvested = 0; p.roundBet = 0; p.hasActed = false; p.folded = false; p.inHand = (p.stack > 0 && !p.resting); p.lastActionBet = 0; p.lastActLabel = null; });
   const order = seatsFromDealer().filter(p => p.inHand);
-  if (order.length < 2) { log("至少需要 2 名有筹码且在线的玩家才能开始"); room.phase = "lobby"; return; }
+  if (order.length < 2) { log("至少需要 2 名有筹码且不休息的玩家才能开始"); room.phase = "lobby"; return; }
   let sbP, bbP;
   if (order.length === 2) { sbP = order[1]; bbP = order[0]; } else { sbP = order[0]; bbP = order[1]; }
   const paidSb = Math.min(sbP.stack, room.config.sb); sbP.stack -= paidSb; sbP.roundBet += paidSb; sbP.totalInvested += paidSb;
@@ -307,13 +309,30 @@ function nextRound(){
   if (room.street >= 3) { endHand(); return; }
   const pending = room.players.filter(p => p.inHand && !p.folded && p.stack > 0 && !p.hasActed);
   if (pending.length > 0) { log("还有玩家未下注（" + pending.map(p=>p.name).join("、") + "），请等本轮下注完成"); return; }
-  room.street++; room.round++; room.currentBet = 0; room.lastRaiseSize = room.config.bb; room.noRaise = false; room.lastBettorId = null;
-  room.players.forEach(p => { p.roundBet = 0; p.hasActed = false; });
+  room.street++; room.round++; room.currentBet = 0; room.lastRaiseSize = room.config.bb; room.noRaise = false; room.lastBettorId = null; room.raiseCount = 0;
+  room.players.forEach(p => { p.roundBet = 0; p.hasActed = false; p.lastActLabel = null; });
   const q = actionQueue(); const first = q[0];
   if (first) { room.turn = { playerId: first, deadline: Date.now() + room.config.turnSeconds * 1000 }; log("第 " + (room.round + 1) + " 轮下注开始（" + streetName() + "）：从 " + pname(first) + " 开始行动"); }
   else { room.turn = null; log("本轮无玩家需要行动"); }
 }
 function streetName(){ return ["翻前","翻后","转牌","河牌"][room.street] || ("第" + (room.street + 1) + "轮"); }
+/* 根据当前下注轮（street）和本轮的加注次数，返回标准的专业加注叫法 */
+function raiseLabel(street, raiseCount){
+  if (street === 0) {  // 翻牌前：BB 视为第1个bet，open=第2个bet
+    if (raiseCount === 1) return "open";   // 第一个加注 = 开池加注
+    if (raiseCount === 2) return "3-bet";
+    if (raiseCount === 3) return "4-bet";
+    if (raiseCount === 4) return "5-bet";
+    if (raiseCount >= 5) return (raiseCount + 1) + "-bet";
+  } else {             // 翻牌后：第一个下注 = bet
+    if (raiseCount === 1) return "bet";
+    if (raiseCount === 2) return "raise";
+    if (raiseCount === 3) return "3-bet";
+    if (raiseCount === 4) return "4-bet";
+    if (raiseCount >= 5) return raiseCount + "-bet";
+  }
+  return "raise";
+}
 
 function endHand(){
   if (room.phase !== "betting") return false;
@@ -327,10 +346,33 @@ function endHand(){
 
 function doSettle(){
   const map = {}; room.order.forEach(o => map[o.id] = o.rank);
-  const entries = room.players.filter(p => p.totalInvested > 0).map(p => ({ id: p.id, name: p.name, bet: p.totalInvested, rank: map[p.id] || 999 }));
+  const entries = room.players.filter(p => p.totalInvested > 0).map(p => ({ id: p.id, name: p.name, seat: p.seat || 0, bet: p.totalInvested, rank: map[p.id] || 999 }));
   const { pots, results } = settle(entries);
+  /* 结算前记录每位玩家的筹码（用于计算变化） */
+  const beforeStacks = {};
+  room.players.forEach(p => { beforeStacks[p.id] = p.stack; });
   room.players.forEach(p => { const r = results.find(x => x.id === p.id); if (r) p.stack += r.win; });
   room.result = { pots, results }; room.phase = "show"; rotateDealer();
+  /* 对局记录：体现庄家点选赢家后每位玩家的具体筹码额（投入 / 赢得 / 净盈亏） */
+  const sumLine = results.length
+    ? results.map(r => {
+        const netStr = r.net >= 0 ? "+" + r.net : String(r.net);
+        return r.name + " 赢得 " + r.win + "（投入 " + r.bet + "，净 " + netStr + "）";
+      }).join("；")
+    : "无";
+  log("本手结算：" + sumLine);
+  /* 结构化记录每手结算详情（完整历史页面渲染成玩家筹码变化表） */
+  /* 只显示参与本手的玩家（totalInvested > 0），避免未参与玩家冗余显示 */
+  const handDetails = room.players.filter(p => p.totalInvested > 0).map(p => {
+    const r = results.find(x => x.id === p.id);
+    const before = beforeStacks[p.id] || 0;
+    const after = p.stack;
+    const invested = p.totalInvested || 0;
+    const won = r ? r.win : 0;
+    const net = r ? r.net : (after - before);
+    return { name: p.name, seat: p.seat, before: before, invested: invested, won: won, net: net, after: after };
+  });
+  appendHistory({ t: Date.now(), m: "本手结算：" + sumLine, type: "hand-settlement", handNo: room.handsPlayed, players: handDetails });
   log("结算完成，下一手由 " + pname(room.dealerId) + "（新庄家）点开始");
 }
 
@@ -342,9 +384,10 @@ function buildCommonState(onlineSet){
   if (stateCache && (now - stateCacheTime) < 50) return stateCache;
   const players = room.players.map(p => ({
     id: p.id, name: p.name, seat: p.seat || 0, stack: p.stack, inHand: p.inHand, folded: p.folded,
-    roundBet: p.roundBet, totalInvested: p.totalInvested, hasActed: p.hasActed,
+    roundBet: p.roundBet, totalInvested: p.totalInvested, hasActed: p.hasActed, lastActionBet: p.lastActionBet || 0,
+    lastActLabel: p.lastActLabel || null,
     isTurn: !!(room.turn && room.turn.playerId === p.id), isDealer: p.id === room.dealerId, isOwner: p.id === room.ownerId,
-    addLeft: p.addLeft, resting: p.resting, online: onlineSet.has(p.id),
+    addLeft: p.addLeft, resting: p.resting, online: onlineSet.has(p.id), unreadTransfers: p.unreadTransfers || [],
   }));
   stateCache = {
     now, ownerId: room.ownerId, dealerId: room.dealerId,
@@ -373,6 +416,8 @@ function makeStateFor(ws, common, onlineSet){
     order: isDealer ? room.order : null,
     result: room.phase === "show" ? room.result : null,
     totalBuyin: common.totalBuyin, logs: common.logs,
+    /* 双保险：发给当前玩家的待处理交易请求也随 state 广播，避免单独消息丢失导致看不到同意/拒绝弹窗 */
+    myReqs: room.pending.filter(r => r.toId === myId).map(r => ({ id: r.id, kind: r.type, fromName: pname(r.fromId), amount: r.amount })),
   };
 }
 
@@ -419,15 +464,11 @@ function handle(ws, raw){
       if (pl) {
         pl.ip = ws.__ip || pl.ip;
         info.playerId = pl.id;
-        // 大厅阶段（游戏未开始）：允许更新带入筹码
-        if (room.phase === "lobby") {
-          const newStack = Math.max(0, Math.floor(+m.stack || 0));
-          if (newStack > 0 && newStack !== pl.stack) {
-            room.totalBuyin += (newStack - pl.stack);
-            pl.stack = newStack;
-            pl.initialBuyin = newStack;
-            log(name + " 更新带入筹码为 " + newStack);
-          }
+        // 同名玩家重连：以服务端筹码为准，不使用客户端 localStorage 的旧值覆盖
+        // （转账、买卖、带入、结算等变化都发生在服务端，客户端值可能过时）
+        const clientStack = Math.max(0, Math.floor(+m.stack || 0));
+        if (clientStack > 0 && clientStack !== pl.stack) {
+          log(name + " 重连，客户端带入 " + clientStack + " 与服务端 " + pl.stack + " 不一致，以服务端为准");
         }
         // 关键：关闭同一个 playerId 的旧连接（先收集再删除，避免遍历Map时删除的问题）
         const oldConns = [];
@@ -438,7 +479,6 @@ function handle(ws, raw){
         }
         for (const oldWs of oldConns) {
           const oldInfo = clients.get(oldWs);
-          console.log("[DEBUG] Replacing old connection for player:", pl.name, "readyState:", oldWs.readyState);
           // 先通知旧连接"你被顶替了，不要重连"，再关闭
           try { if(oldWs.readyState === 1) oldWs.send(JSON.stringify({type:"replaced"})); } catch(e) {}
           setTimeout(() => { try { oldWs.terminate(); } catch(e) {} }, 100);
@@ -447,7 +487,7 @@ function handle(ws, raw){
         if (oldConns.length > 0) log(name + " 重连，关闭了 " + oldConns.length + " 个旧连接");
         // 重连: 取消离线检查，恢复 inHand
         cancelOfflineCheck(pl.id);
-        if (room.phase === "betting" && !pl.folded && pl.stack > 0) {
+        if (room.phase === "betting" && !pl.folded && pl.stack > 0 && !pl.resting) {
           pl.inHand = true;
           log(name + " 重新连接，恢复本局下注资格");
         } else {
@@ -456,7 +496,7 @@ function handle(ws, raw){
       }
       else {
         const amt = Math.max(0, Math.floor(+m.stack || 0)); const midHand = room.phase === "betting";
-        pl = { id: uid(), name, ip: ws.__ip || "", stack: amt, seat: nextSeat(), totalInvested: 0, roundBet: 0, folded: false, hasActed: true, inHand: !midHand, addLeft: room.config.addCount, resting: false, initialBuyin: amt, boughtTotal: 0, soldTotal: 0, reloadTotal: 0 };
+        pl = { id: uid(), name, ip: ws.__ip || "", stack: amt, seat: nextSeat(), totalInvested: 0, roundBet: 0, folded: false, hasActed: true, inHand: !midHand, addLeft: room.config.addCount, resting: false, initialBuyin: amt, boughtTotal: 0, soldTotal: 0, reloadTotal: 0, unreadTransfers: [], lastActLabel: null };
         if (midHand) pl.folded = true;
         room.players.push(pl); room.totalBuyin += amt; info.playerId = pl.id;
         log(name + " 加入牌局" + (amt ? "，带入 " + amt : "") + (midHand ? "（本手不参与，下一手开始下注）" : ""));
@@ -476,7 +516,11 @@ function handle(ws, raw){
     case "remove-player": {
       if (!isOwner) return; const i = room.players.findIndex(p => p.id === m.id); if (i < 0) return;
       const wasDealer = room.dealerId === m.id, wasOwner = room.ownerId === m.id;
-      log(room.players[i].name + " 被移出牌局"); room.players.splice(i, 1);
+      const removedName = room.players[i].name;
+      log(removedName + " 被移出牌局"); room.players.splice(i, 1);
+      /* 清理被移出玩家的残留状态，避免其旧连接/离线检查触发"？已离线/？连接已关闭"占位日志 */
+      cancelOfflineCheck(m.id);
+      for (const [ws, info] of clients) { if (info && info.playerId === m.id) { try { ws.close(); } catch(e){} } }
       if (room.players.length) {
         if (wasDealer || !findPlayer(room.dealerId)) rotateDealer();
         if (wasOwner || !findPlayer(room.ownerId)) { room.ownerId = room.players[0].id; log(room.players[0].name + " 接任房主"); }
@@ -493,6 +537,14 @@ function handle(ws, raw){
       break;
     }
     case "set-owner": { const target = findPlayer(String(m.id || "")); if (!target) return; room.ownerId = target.id; log(target.name + "（" + (target.seat || "?") + " 号座）被任命为房主"); break; }
+    case "set-dealer": {
+      /* 房主手动任命庄家（荷官）：解决庄家掉线/休息后无人开牌、点赢家导致对局卡住的问题 */
+      if (!isOwner) return;
+      const target = findPlayer(String(m.id || "")); if (!target) return;
+      room.dealerId = target.id;
+      log(target.name + "（" + (target.seat || "?") + " 号座）被房主任命为庄家（荷官）");
+      break;
+    }
     case "reset": {
       if (!isOwner) return;
       const cfg = room.config;
@@ -516,6 +568,8 @@ function handle(ws, raw){
         log("牌局结算完成，共 " + sp.length + " 位玩家，总剩余 " + sp.reduce((s,p)=>s+p.finalStack,0));
       }
       const oldLogs = room.logs;
+      /* 重置前关闭历史文件流，避免文件句柄泄漏 */
+      if (historyStream) { try { historyStream.end(); } catch(e) {} historyStream = null; }
       room = newRoom();
       room.config = cfg;
       room.logs = oldLogs;
@@ -550,19 +604,28 @@ function handle(ws, raw){
     }
     case "undo-bet": {
       if (!me || room.phase !== "betting") return;
-      if (me.roundBet <= 0) { toast(ws, "你本轮没有下注"); break; }
+      if ((me.lastActionBet || 0) <= 0) { toast(ws, "你本次没有可撤销的下注"); break; }
       if (room.lastBettorId !== me.id) { toast(ws, "已有其他玩家下注，无法撤销"); break; }
-      const refund = me.roundBet;
-      me.stack += refund; me.totalInvested -= refund; me.roundBet = 0; me.hasActed = false;
+      const refund = me.lastActionBet || 0;
+      /* 若撤销的是加注动作，回退本轮加注计数（保证 open/3-bet/4-bet 叫法正确） */
+      const raiseLabels = new Set(["open","bet","raise","3-bet","4-bet","5-bet","6-bet","7-bet","8-bet","9-bet"]);
+      if (raiseLabels.has(me.lastActLabel)) room.raiseCount = Math.max(0, room.raiseCount - 1);
+      me.stack += refund; me.totalInvested -= refund; me.roundBet -= refund; me.hasActed = false; me.lastActionBet = 0; me.lastActLabel = null;
       let newCur = 0;
       for (const p of room.players) { if (p.roundBet > newCur) { newCur = p.roundBet; } }
-      room.currentBet = newCur; room.lastBettorId = null;
-      room.lastRaiseSize = room.config.bb; room.noRaise = false;
+      room.currentBet = newCur;
+      /* 撤销后 lastBettorId 改为当前 roundBet 最高的玩家（而非 null），保证后续撤销判断正确 */
+      let maxBet = 0, maxBettorId = null;
+      for (const p of room.players) { if (p.roundBet > maxBet) { maxBet = p.roundBet; maxBettorId = p.id; } }
+      room.lastBettorId = maxBettorId;
+      /* 恢复加注前的 lastRaiseSize（如果是跟注撤销则用默认大盲） */
+      room.lastRaiseSize = me._prevLastRaiseSize || room.config.bb;
+      room.noRaise = false;
+      me._prevLastRaiseSize = null;
       const savedDeadline = me._undoDeadline || (Date.now() + room.config.turnSeconds * 1000);
       room.turn = { playerId: me.id, deadline: savedDeadline };
       me._undoDeadline = null;
-      log(me.name + " 撤销了本轮下注，拿回 " + refund + "，请重新下注");
-      broadcast(); save();
+      log(me.name + " 撤销了本次下注，拿回 " + refund + "，请重新下注");
       break;
     }
     case "act": {
@@ -571,21 +634,23 @@ function handle(ws, raw){
       const action = m.action; const need = needToCallOf(me);
       if (action === "check") {
         if (need > 0) { toast(ws, "前面有玩家下注 " + room.currentBet + "，不能过牌，请跟注 / 加注 / 弃牌"); return; }
-        me.hasActed = true; log(me.name + " 过牌");
-      } else if (action === "fold") { me.folded = true; me.hasActed = true; log(me.name + " 弃牌"); afterAction(); break; }
-      else if (action === "call") { me._undoDeadline = room.turn ? room.turn.deadline : null; const pay = Math.min(me.stack, need); me.stack -= pay; me.roundBet += pay; me.totalInvested += pay; me.hasActed = true; room.lastBettorId = me.id; log(me.name + " 跟注 " + pay + (pay < need ? "（全下）" : "")); }
+        me.hasActed = true; me.lastActLabel = "check"; log(me.name + " 过牌");
+      } else if (action === "fold") { me.folded = true; me.hasActed = true; me.lastActLabel = "fold"; log(me.name + " 弃牌"); afterAction(); break; }
+      else if (action === "call") { me._undoDeadline = room.turn ? room.turn.deadline : null; const pay = Math.min(me.stack, need); me.stack -= pay; me.roundBet += pay; me.totalInvested += pay; me.hasActed = true; me.lastActionBet = pay; me.lastActLabel = (room.street === 0 && room.raiseCount === 0) ? "limp" : "call"; room.lastBettorId = me.id; log(me.name + " 跟注 " + pay + (pay < need ? "（全下）" : "")); }
       else if (action === "allin") {
         me._undoDeadline = room.turn ? room.turn.deadline : null;
         const pay = me.stack; const prevBet = room.currentBet; const total = me.roundBet + pay;
-        me.stack = 0; me.roundBet += pay; me.totalInvested += pay; me.hasActed = true;
+        me.stack = 0; me.roundBet += pay; me.totalInvested += pay; me.hasActed = true; me.lastActionBet = pay; me.lastActLabel = "all-in";
         if (total > prevBet) {
           const raiseAmt = total - prevBet;
+          /* 记录加注前的 lastRaiseSize，用于撤销时恢复 */
+          me._prevLastRaiseSize = room.lastRaiseSize;
           if (raiseAmt >= room.lastRaiseSize) {
-            room.currentBet = total; room.lastRaiseSize = raiseAmt;
+            room.currentBet = total; room.lastRaiseSize = raiseAmt; room.raiseCount++;
             room.players.forEach(p => { if (p !== me && p.inHand && !p.folded && p.stack > 0) p.hasActed = false; });
             log(me.name + " 全下 " + pay + "（构成加注到 " + total + "）");
           } else {
-            room.currentBet = total; room.noRaise = true;
+            room.currentBet = total; room.lastRaiseSize = raiseAmt; room.noRaise = true;
             room.players.forEach(p => { if (p !== me && p.inHand && !p.folded && p.stack > 0) p.hasActed = false; });
             log(me.name + " 全下 " + pay + "（到 " + total + "，不足最小加注额，本轮只能跟注/弃牌）");
           }
@@ -599,8 +664,11 @@ function handle(ws, raw){
         if (total <= room.currentBet) { toast(ws, "下注不能低于前面玩家的下注 " + room.currentBet + "（全下除外）"); return; }
         const raiseAmt = total - room.currentBet;
         if (raiseAmt < room.lastRaiseSize) { toast(ws, "加注额至少 " + room.lastRaiseSize + "（最小加注额），当前只加了 " + raiseAmt + "，请加注到至少 " + (room.currentBet + room.lastRaiseSize)); return; }
-        me.stack -= amount; me.roundBet += amount; me.totalInvested += amount; me.hasActed = true;
-        room.currentBet = total; room.lastRaiseSize = raiseAmt;
+        /* 记录加注前的 lastRaiseSize，用于撤销时恢复 */
+        me._prevLastRaiseSize = room.lastRaiseSize;
+        me.stack -= amount; me.roundBet += amount; me.totalInvested += amount; me.hasActed = true; me.lastActionBet = amount;
+        room.currentBet = total; room.lastRaiseSize = raiseAmt; room.raiseCount++;
+        me.lastActLabel = raiseLabel(room.street, room.raiseCount);
         room.players.forEach(p => { if (p !== me && p.inHand && !p.folded && p.stack > 0) p.hasActed = false; });
         room.lastBettorId = me.id; log(me.name + " 加注到 " + total + "（加注额 " + raiseAmt + "，最小加注额更新为 " + raiseAmt + "）");
       } else return;
@@ -633,12 +701,42 @@ function handle(ws, raw){
     case "reload-chips": {
       if (!me) return; const amt = Math.floor(+m.amount); if (!(amt > 0)) return;
       const ownerP = findPlayer(room.ownerId);
-      if (!ownerP || ownerP.id === me.id) { me.stack += amt; room.totalBuyin += amt; me.reloadTotal = (me.reloadTotal || 0) + amt; log(me.name + " 继续代入 " + amt + " 筹码"); break; }
+      if (!ownerP || ownerP.id === me.id) {
+        me.stack += amt; room.totalBuyin += amt; me.reloadTotal = (me.reloadTotal || 0) + amt;
+        const reloadMsg = me.name + " 继续代入 " + amt + " 筹码";
+        log(reloadMsg);
+        appendHistory({ t: Date.now(), m: reloadMsg, type: "reload", player: me.name, amount: amt, balanceAfter: me.stack });
+        break;
+      }
       const req = { id: "r" + (++reqSeq), type: "reload", fromId: me.id, toId: ownerP.id, amount: amt };
       room.pending.push(req); log(me.name + " 请求代入 " + amt + " 筹码，等待房主 " + ownerP.name + " 确认");
       toast(ws, "已发送代入请求，等待房主同意");
       sendToPlayer(ownerP.id, { type: "request", id: req.id, kind: "reload", fromName: me.name, amount: amt });
       scheduleReqTimeout(req); break;
+    }
+    case "transfer-chips": {
+      if (!me) return;
+      const target = findPlayer(m.toId);
+      const amt = Math.floor(+m.amount);
+      if (!target || target.id === me.id || !(amt > 0)) { toast(ws, "无效的转账"); return; }
+      if (me.stack < amt) { toast(ws, "你的筹码不足"); return; }
+      me.stack -= amt; target.stack += amt;
+      /* 记录未读转账通知，无论目标是否在线，上线后都会弹出提示 */
+      target.unreadTransfers = target.unreadTransfers || [];
+      target.unreadTransfers.push({ from: me.name, amount: amt, time: Date.now() });
+      const transferMsg = me.name + " 向 " + target.name + " 手动转账 " + amt + " 筹码";
+      log(transferMsg);
+      appendHistory({ t: Date.now(), m: transferMsg, type: "transfer", player: me.name, amount: -amt, balanceAfter: me.stack });
+      appendHistory({ t: Date.now(), m: target.name + " 收到 " + me.name + " 转账 " + amt + " 筹码", type: "transfer", player: target.name, amount: amt, balanceAfter: target.stack });
+      toast(ws, "已向 " + target.name + " 转账 " + amt + " 筹码");
+      /* 在线玩家额外发一个 toast 提示 */
+      sendToPlayer(target.id, { type: "toast", msg: me.name + " 向你转账了 " + amt + " 筹码" });
+      break;
+    }
+    case "clear-transfer-notif": {
+      if (!me) return;
+      me.unreadTransfers = [];
+      break;
     }
     case "approve-request": {
       const req = room.pending.find(r => r.id === m.id); if (!req) return;
@@ -648,10 +746,17 @@ function handle(ws, raw){
       if (!fromP || !toP) { toast(ws, "请求对象已不在牌局"); return; }
       if (req.type === "buy") {
         if (toP.stack < req.amount) { toast(ws, "你的筹码不足，交易取消"); sendToPlayer(fromP.id, { type: "toast", msg: "卖家筹码不足，交易取消" }); break; }
-        fromP.stack += req.amount; toP.stack -= req.amount; fromP.boughtTotal = (fromP.boughtTotal || 0) + req.amount; toP.soldTotal = (toP.soldTotal || 0) + req.amount; log(fromP.name + " 向 " + toP.name + " 购买 " + req.amount + " 筹码，已完成");
+        fromP.stack += req.amount; toP.stack -= req.amount; fromP.boughtTotal = (fromP.boughtTotal || 0) + req.amount; toP.soldTotal = (toP.soldTotal || 0) + req.amount;
+        const buyMsg = fromP.name + " 向 " + toP.name + " 购买 " + req.amount + " 筹码，已完成";
+        log(buyMsg);
+        appendHistory({ t: Date.now(), m: buyMsg, type: "buy", player: fromP.name, amount: req.amount, balanceAfter: fromP.stack });
+        appendHistory({ t: Date.now(), m: toP.name + " 卖出 " + req.amount + " 筹码给 " + fromP.name, type: "sell", player: toP.name, amount: -req.amount, balanceAfter: toP.stack });
         sendToPlayer(fromP.id, { type: "toast", msg: "卖家已同意，收到 " + req.amount + " 筹码" });
       } else {
-        fromP.stack += req.amount; room.totalBuyin += req.amount; fromP.reloadTotal = (fromP.reloadTotal || 0) + req.amount; log(fromP.name + " 代入 " + req.amount + " 筹码，房主已同意");
+        fromP.stack += req.amount; room.totalBuyin += req.amount; fromP.reloadTotal = (fromP.reloadTotal || 0) + req.amount;
+        const reloadMsg = fromP.name + " 代入 " + req.amount + " 筹码，房主已同意";
+        log(reloadMsg);
+        appendHistory({ t: Date.now(), m: reloadMsg, type: "reload", player: fromP.name, amount: req.amount, balanceAfter: fromP.stack });
         sendToPlayer(fromP.id, { type: "toast", msg: "房主已同意，代入 " + req.amount + " 筹码" });
       }
       break;
@@ -717,7 +822,7 @@ const server = http.createServer((req, res) => {
         h += "<div style=\'font-weight:bold;color:#c82828;margin-bottom:6px;font-size:14px;\'>\u25bc 牌局结算汇总（重置牌局）</div>";
         h += "<table style=\'width:100%;border-collapse:collapse;font-size:12px;\'>";
         h += "<thead><tr style=\'background:#2d3732;color:#fff;\'>";
-        ["玩家昵称","初始带入","买入","卖出","场外带入","最终剩余","净盈亏"].forEach(c => { h += "<th style=\'padding:6px;border:1px solid #ddd;\'>"+c+"</th>"; });
+        ["玩家昵称","初始带入","买入","卖出","场外带入","最终剩余","净盈亏(注码)","转账(元)"].forEach(c => { h += "<th style=\'padding:6px;border:1px solid #ddd;\'>"+c+"</th>"; });
         h += "</tr></thead><tbody>";
         o.players.forEach(p => {
           const redStyle = "color:#c82828;background:#fff0f0;font-weight:bold;";
@@ -730,6 +835,13 @@ const server = http.createServer((req, res) => {
           h += td(String(p.finalStack||0), {style:redStyle, align:"center"});
           const np = p.netProfit || 0;
           h += td((np>0?"+":"")+np, {style:np>0?"color:#2a8a2a;":np<0?"color:#c82828;":"", align:"center"});
+          /* 转账列：本金=初始带入+场外带入，转账=最终剩余-本金，除以2为金额（1注码=0.5元） */
+          const principal = (p.initialBuyin||0) + (p.reload||0);
+          const transferChips = (p.finalStack||0) - principal;
+          const transferYuan = (transferChips / 2).toFixed(1);
+          const transferStyle = transferChips > 0 ? "color:#2a8a2a;background:#f0fff0;font-weight:bold;" : transferChips < 0 ? "color:#c82828;background:#fff0f0;font-weight:bold;" : "";
+          const transferText = transferChips > 0 ? "+" + transferYuan + "（收）" : transferChips < 0 ? transferYuan + "（付）" : "0";
+          h += td(transferText, {style:transferStyle, align:"center"});
           h += "</tr>";
         });
         const goldStyle = "color:#b48c28;background:#fffaf0;font-weight:bold;";
@@ -743,30 +855,70 @@ const server = http.createServer((req, res) => {
         h += td(String(o.totalFinal||0), {style:redStyle2, align:"center"});
         const totalNet = (o.totalFinal||0) - (o.totalInitial||0) - (o.totalBought||0) + (o.totalSold||0) - (o.totalReload||0);
         h += td((totalNet>0?"+":"")+totalNet, {style:goldStyle, align:"center"});
+        /* 合计转账 */
+        const totalPrincipal = (o.totalInitial||0) + (o.totalReload||0);
+        const totalTransfer = (o.totalFinal||0) - totalPrincipal;
+        const totalTransferYuan = (totalTransfer / 2).toFixed(1);
+        const totalTransferText = totalTransfer > 0 ? "+" + totalTransferYuan : totalTransfer < 0 ? totalTransferYuan : "0";
+        h += td(totalTransferText, {style:goldStyle, align:"center"});
         h += "</tr>";
+        h += "</tbody></table></div></td></tr>";
+        return h;
+      };
+      /* 渲染每手结算详情表 */
+      const renderHandSettlement = (o) => {
+        if (!o.players || !o.players.length) return "";
+        let h = "<tr><td colspan=\'5\' style=\'padding:0;border:none;\'>";
+        h += "<div style=\'margin:8px 0;\'>";
+        h += "<div style=\'font-weight:bold;color:#2a6a8a;margin-bottom:6px;font-size:13px;\'>\u25bc 第 " + (o.handNo||"?") + " 手结算详情</div>";
+        h += "<table style=\'width:100%;border-collapse:collapse;font-size:11px;\'>";
+        h += "<thead><tr style=\'background:#3a4a5a;color:#fff;\'>";
+        ["玩家","结算前筹码","本手投入","赢得","净盈亏","结算后筹码"].forEach(c => { h += "<th style=\'padding:5px;border:1px solid #ddd;\'>"+c+"</th>"; });
+        h += "</tr></thead><tbody>";
+        o.players.forEach(p => {
+          const netStyle = p.net > 0 ? "color:#2a8a2a;font-weight:bold;" : p.net < 0 ? "color:#c82828;font-weight:bold;" : "";
+          h += "<tr>";
+          h += td(esc(p.name), {align:"center"});
+          h += td(String(p.before||0), {align:"center"});
+          h += td(String(p.invested||0), {align:"center"});
+          h += td("+"+(p.won||0), {style:p.won>0?"color:#2a8a2a;":"", align:"center"});
+          h += td((p.net>0?"+":"")+(p.net||0), {style:netStyle, align:"center"});
+          h += td(String(p.after||0), {style:"font-weight:bold;", align:"center"});
+          h += "</tr>";
+        });
         h += "</tbody></table></div></td></tr>";
         return h;
       };
       let body = "";
       body += "<table style=\'width:100%;border-collapse:collapse;font-size:13px;font-family:system-ui,sans-serif;\'>";
       body += "<thead><tr style=\'background:#2d3732;color:#fff;\'>";
-      ["时间","事件","玩家","金额","余额变化"].forEach(c => { body += "<th style=\'padding:8px;border:1px solid #ddd;text-align:center;\'>"+c+"</th>"; });
+      ["时间","事件","玩家","金额","操作后余额"].forEach(c => { body += "<th style=\'padding:8px;border:1px solid #ddd;text-align:center;\'>"+c+"</th>"; });
       body += "</tr></thead><tbody>";
       rows.forEach(o => {
         if (o.type === "settlement") { body += renderSettlement(o); return; }
+        if (o.type === "hand-settlement") { body += renderHandSettlement(o); return; }
         const msg = o.m || "";
         const isBuy = msg.indexOf("购买") >= 0;
         const isReload = msg.indexOf("代入") >= 0 || msg.indexOf("继续代入") >= 0;
+        const isTransfer = msg.indexOf("转账") >= 0;
         let rowStyle = "";
         let textColor = "#333";
         if (isBuy) { rowStyle = "background:#e6f0ff;"; textColor = "#1e50a0"; }
         else if (isReload) { rowStyle = "background:#fff5e6;"; textColor = "#b46414"; }
+        else if (isTransfer) { rowStyle = "background:#f0e6ff;"; textColor = "#6a3aa0"; }
+        /* 从消息中提取玩家名和金额（用于填充玩家/金额列） */
+        let playerName = "";
+        let amountStr = "";
+        let balanceStr = "";
+        if (o.player) playerName = o.player;
+        if (o.amount != null) amountStr = (o.amount > 0 ? "+" : "") + o.amount;
+        if (o.balanceAfter != null) balanceStr = String(o.balanceAfter);
         body += "<tr style=\'"+rowStyle+"\'>";
         body += td(fmtTime(o.t), {style:"color:#888;", align:"center"});
         body += td(esc(msg), {style:"color:"+textColor+";"});
-        body += td("", {align:"center"});
-        body += td("", {align:"right"});
-        body += td("", {align:"center"});
+        body += td(playerName ? esc(playerName) : "", {align:"center"});
+        body += td(amountStr, {style:o.amount>0?"color:#2a8a2a;":o.amount<0?"color:#c82828;":"", align:"right"});
+        body += td(balanceStr, {align:"center"});
         body += "</tr>";
       });
       body += "</tbody></table>";
@@ -778,7 +930,10 @@ const server = http.createServer((req, res) => {
         "<div style=\'margin-top:12px;font-size:12px;color:#666;\'>" +
         "<span style=\'display:inline-block;width:14px;height:14px;background:#e6f0ff;border:1px solid #ddd;vertical-align:middle;margin-right:4px;\'></span>筹码买卖 " +
         "<span style=\'display:inline-block;width:14px;height:14px;background:#fff5e6;border:1px solid #ddd;vertical-align:middle;margin:0 4px 0 12px;\'></span>场外带入 " +
-        "<span style=\'display:inline-block;width:14px;height:14px;background:#fff0f0;border:1px solid #ddd;vertical-align:middle;margin:0 4px 0 12px;\'></span>结算汇总（昵称+最终剩余红色）" +
+        "<span style=\'display:inline-block;width:14px;height:14px;background:#f0e6ff;border:1px solid #ddd;vertical-align:middle;margin:0 4px 0 12px;\'></span>手动转账 " +
+        "<span style=\'display:inline-block;width:14px;height:14px;background:#e8f4f8;border:1px solid #ddd;vertical-align:middle;margin:0 4px 0 12px;\'></span>每手结算详情 " +
+        "<span style=\'display:inline-block;width:14px;height:14px;background:#fff0f0;border:1px solid #ddd;vertical-align:middle;margin:0 4px 0 12px;\'></span>结算汇总（重置牌局）" +
+        "<div style=\'margin-top:8px;color:#888;\'>注：1注码 = 0.5元，转账列金额已换算为元</div>" +
         "</div></body></html>");
     });
     return;
@@ -850,7 +1005,9 @@ wss.on("connection", (ws, req) => {
       // 立即检查是否还有其他连接对应这个玩家，如果没有就标记离线
       const stillOnline = [...clients.values()].some(i => i.playerId === info.playerId);
       if (!stillOnline) {
-        log(pname(info.playerId) + " 连接已关闭");
+        const p = findPlayer(info.playerId);
+        if (p) log(p.name + " 连接已关闭");
+        // 找不到 p → 已被移出牌局，不再记"?"占位日志
       }
       // 安排离线检查（15秒宽限期，允许重连）
       scheduleOfflineCheck(info.playerId);
@@ -873,7 +1030,6 @@ setInterval(() => {
     // 超过10秒没收到任何消息（含应用层心跳），判定掉线，主动断开
     if (now - info.lastPong > HEARTBEAT_TIMEOUT) {
       const who = info.playerId ? (findPlayer(info.playerId) || {}).name : "unknown";
-      console.log("[HEARTBEAT] timeout:", who, "lastPongAgo:", now - info.lastPong);
       try { ws.terminate(); } catch (e) {}
       toRemove.push(ws);
       if (info.playerId) scheduleOfflineCheck(info.playerId);
